@@ -1,8 +1,8 @@
 # Streamlit Technical SEO Auditor
 # -----------------------------------------------------------
 # A single-file Streamlit app for lightweight technical SEO audits.
-# Now extended to show each issue type with the list of affected URLs
-# and downloadable CSVs per issue.
+# Extended with an Issues explorer, more technical checks, and
+# resource-level details (e.g., list image URLs missing ALT, mixed content URLs).
 #
 # ▶ Run locally:
 #     pip install streamlit requests beautifulsoup4 pandas lxml openpyxl
@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections import deque
-from dataclasses import dataclass, asdict
+from collections import deque, defaultdict
+from dataclasses import dataclass, asdict, field
 from urllib.parse import urljoin, urlparse, urlunparse
 import xml.etree.ElementTree as ET
 
@@ -32,7 +32,7 @@ DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36 SEO-Auditor/1.0"
+        "Chrome/124.0 Safari/537.36 SEO-Auditor/1.1"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
@@ -44,6 +44,8 @@ TITLE_RECOMMENDED_MIN = 30
 TITLE_RECOMMENDED_MAX = 60
 META_DESC_RECOMMENDED_MIN = 70
 META_DESC_RECOMMENDED_MAX = 160
+SLOW_RESPONSE_MS = 1500
+LARGE_PAGE_BYTES = 2_000_000  # ~2 MB
 
 # -------------------------------
 # Dataclasses
@@ -75,6 +77,7 @@ class PageAudit:
 
     images: int | None
     images_missing_alt: int | None
+    images_missing_alt_urls: list[str] | None = field(default=None)
 
     internal_links: int | None
     external_links: int | None
@@ -88,12 +91,15 @@ class PageAudit:
 
     https: bool
     mixed_content: int | None
+    mixed_content_urls: list[str] | None = field(default=None)
 
     indexable: bool | None
     blocked_by_robots_meta: bool | None
     blocked_by_xrobots: bool | None
 
-    notes: str
+    inlinks_internal: int | None = None  # computed post-crawl
+
+    notes: str = ""
 
 
 # -------------------------------
@@ -110,16 +116,13 @@ def normalise_url(u: str) -> str:
     netloc = parsed.netloc.lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
-    # Remove default ports
     if (":" in netloc):
         host, _, port = netloc.partition(":")
         if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
             netloc = host
     path = re.sub(r"//+", "/", parsed.path or "/")
-    # Remove trailing slash except for root
     if path != "/" and path.endswith("/"):
         path = path[:-1]
-    # Drop fragment
     return urlunparse((scheme, netloc, path, "", parsed.query or "", ""))
 
 
@@ -139,7 +142,6 @@ def is_http_url(u: str) -> bool:
 
 @st.cache_data(show_spinner=False)
 def fetch_url(url: str):
-    """Fetch a URL and return (response, content, error, elapsed_seconds)."""
     start = time.time()
     try:
         resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
@@ -166,9 +168,6 @@ def read_robots_txt(base_url: str) -> robotparser.RobotFileParser:
 
 @st.cache_data(show_spinner=False)
 def parse_sitemap_urls(base_url: str) -> list[str]:
-    """Attempt to find and parse sitemap.xml to seed the crawl.
-    Supports simple sitemap index and urlset.
-    """
     urls: list[str] = []
     parsed = urlparse(base_url)
     sitemap_url = urlunparse((parsed.scheme or "https", parsed.netloc, "/sitemap.xml", "", "", ""))
@@ -178,9 +177,7 @@ def parse_sitemap_urls(base_url: str) -> list[str]:
         return urls
     try:
         tree = ET.fromstring(content)
-        ns = {
-            "sm": "http://www.sitemaps.org/schemas/sitemap/0.9",
-        }
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
         if tree.tag.endswith("sitemapindex"):
             for smap in tree.findall("sm:sitemap", ns):
                 loc_el = smap.find("sm:loc", ns)
@@ -221,6 +218,7 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
     canonical = None
     h1_count = h2_count = None
     images = images_missing_alt = None
+    images_missing_alt_urls: list[str] = []
     internal_links = external_links = nofollow_links = 0
     hreflang_count = 0
     structured_types: list[str] = []
@@ -228,6 +226,7 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
     viewport = False
     https = urlparse(final_url).scheme == "https"
     mixed_content = 0
+    mixed_content_urls: list[str] = []
 
     x_robots = None if not resp else resp.headers.get("X-Robots-Tag")
 
@@ -236,7 +235,8 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
     if err:
         notes.append(f"Fetch error: {err}")
 
-    if content and resp and ("text/html" in (resp.headers.get("Content-Type", ""))):
+    ctype = (resp.headers.get("Content-Type", "") if resp else "").lower()
+    if content and resp and ("text/html" in ctype or "application/xhtml+xml" in ctype or ctype.startswith("text/")):
         soup = BeautifulSoup(content, "lxml")
 
         # Language & viewport
@@ -267,10 +267,16 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
         h1_count = len(soup.find_all("h1"))
         h2_count = len(soup.find_all("h2"))
 
-        # Images
+        # Images & ALT
         imgs = soup.find_all("img")
         images = len(imgs)
-        images_missing_alt = sum(1 for i in imgs if not i.get("alt"))
+        for i in imgs:
+            alt = i.get("alt")
+            if not alt:
+                src = i.get("src") or ""
+                full_src = urljoin(final_url, src)
+                images_missing_alt_urls.append(full_src)
+        images_missing_alt = len(images_missing_alt_urls)
 
         # Links
         final_host = urlparse(final_url).netloc
@@ -310,17 +316,18 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
             except Exception:
                 continue
 
-        # Mixed content check: http resources on https page
+        # Mixed content check
         if https:
-            mixed_content = 0
             for tag in soup.find_all(src=True):
                 src = tag.get("src")
                 if isinstance(src, str) and src.startswith("http://"):
                     mixed_content += 1
+                    mixed_content_urls.append(src)
             for tag in soup.find_all(href=True):
                 href = tag.get("href")
                 if isinstance(href, str) and href.startswith("http://"):
                     mixed_content += 1
+                    mixed_content_urls.append(href)
 
     # Derived fields
     title_length = len(title) if title else None
@@ -341,7 +348,7 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
             canonical_resolves = False
         canonical_is_self = normalise_url(can_abs) == normalise_url(final_url)
 
-    # Indexability (simplified): 2xx status, not blocked by robots meta/header
+    # Indexability (simplified)
     indexable = None
     if status is not None:
         indexable = (200 <= status < 300) and not blocked_by_robots_meta and not blocked_by_xrobots
@@ -379,6 +386,7 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
         h2_count=h2_count,
         images=images,
         images_missing_alt=images_missing_alt,
+        images_missing_alt_urls=images_missing_alt_urls or None,
         internal_links=internal_links,
         external_links=external_links,
         nofollow_links=nofollow_links,
@@ -388,6 +396,7 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
         viewport=viewport,
         https=https,
         mixed_content=mixed_content,
+        mixed_content_urls=mixed_content_urls or None,
         indexable=indexable,
         blocked_by_robots_meta=blocked_by_robots_meta,
         blocked_by_xrobots=blocked_by_xrobots,
@@ -401,14 +410,14 @@ def analyse_page(url: str, resp, content: bytes | None, err: str | None, elapsed
 
 def crawl(start_url: str, max_pages: int = 50, obey_robots: bool = True, include_query_urls: bool = False, use_sitemap_seed: bool = True) -> list[PageAudit]:
     base = normalise_url(start_url)
-    base_parsed = urlparse(base)
-    base_root = urlunparse((base_parsed.scheme, base_parsed.netloc, "/", "", "", ""))
-
     rp = read_robots_txt(base)
 
     visited: set[str] = set()
     audits: list[PageAudit] = []
     q: deque[str] = deque()
+
+    # track internal inlinks between crawled URLs
+    inlink_counts: defaultdict[str, int] = defaultdict(int)
 
     seeds: list[str] = []
     if use_sitemap_seed:
@@ -442,22 +451,25 @@ def crawl(start_url: str, max_pages: int = 50, obey_robots: bool = True, include
         processed += 1
         pbar.progress(min(int(processed / max_pages * 100), 100), text=f"Crawling… {processed}/{max_pages}")
 
+        # Enqueue and count inlinks
         if resp and content and ("text/html" in (resp.headers.get("Content-Type", ""))):
             soup = BeautifulSoup(content, "lxml")
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
-                if href.startswith("#"):
-                    continue
-                if href.startswith("mailto:") or href.startswith("tel:"):
+                if href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
                     continue
                 full = urljoin(audit.final_url, href)
-                if is_http_url(full):
+                if is_http_url(full) and same_host(full, base):
                     n = normalise_url(full)
-                    if same_host(n, base) and n not in visited:
-                        if include_query_urls or not urlparse(n).query:
-                            q.append(n)
+                    inlink_counts[n] += 1
+                    if n not in visited and (include_query_urls or not urlparse(n).query):
+                        q.append(n)
 
     pbar.progress(100, text="Crawl complete")
+
+    # annotate inlinks on audits
+    for a in audits:
+        a.inlinks_internal = int(inlink_counts.get(normalise_url(a.final_url), 0))
 
     return audits
 
@@ -475,11 +487,12 @@ def audits_to_df(audits: list[PageAudit]) -> pd.DataFrame:
         "meta_robots", "x_robots",
         "canonical", "canonical_resolves", "canonical_is_self",
         "h1_count", "h2_count",
-        "images", "images_missing_alt",
+        "images", "images_missing_alt", "images_missing_alt_urls",
         "internal_links", "external_links", "nofollow_links",
         "hreflang_count", "structured_data_types",
         "html_lang", "viewport",
-        "https", "mixed_content",
+        "https", "mixed_content", "mixed_content_urls",
+        "inlinks_internal",
         "blocked_by_robots_meta", "blocked_by_xrobots",
         "notes",
     ]
@@ -499,14 +512,20 @@ def summarise_issues(df: pd.DataFrame) -> dict[str, int]:
         "Images missing ALT": int(((df["images_missing_alt"].fillna(0) > 0)).sum()) if "images_missing_alt" in df else 0,
         "Mixed content on HTTPS": int(((df["mixed_content"].fillna(0) > 0)).sum()) if "mixed_content" in df else 0,
         "No viewport meta": int(((df["viewport"].fillna(False) == False)).sum()) if "viewport" in df else 0,
+        # New summaries
+        "Missing canonical": int(((df["canonical"].isna()) | (df["canonical"].astype(str).str.len() == 0)).sum()) if "canonical" in df else 0,
+        "Missing HTML lang": int(((df["html_lang"].isna()) | (df["html_lang"].astype(str).str.len() == 0)).sum()) if "html_lang" in df else 0,
+        "Slow responses (>1500ms)": int(((df["response_time_ms"].fillna(0).astype(int) > SLOW_RESPONSE_MS)).sum()) if "response_time_ms" in df else 0,
+        "Large pages (>2MB)": int(((df["page_bytes"].fillna(0).astype(int) > LARGE_PAGE_BYTES)).sum()) if "page_bytes" in df else 0,
+        "Duplicate titles": int((df["title"].fillna("").duplicated(keep=False)).sum()) if "title" in df else 0,
+        "Duplicate meta descriptions": int((df["meta_description"].fillna("").duplicated(keep=False)).sum()) if "meta_description" in df else 0,
+        "Zero internal links": int(((df["internal_links"].fillna(0).astype(int) == 0)).sum()) if "internal_links" in df else 0,
+        "Orphan-ish (0 inlinks in crawl)": int(((df["inlinks_internal"].fillna(0).astype(int) == 0)).sum()) if "inlinks_internal" in df else 0,
     }
     return issues
 
 
 def build_issue_catalogue(df: pd.DataFrame) -> list[dict]:
-    """Return a list of issue definitions with boolean masks and short descriptions.
-    Each item: {label, mask, description, cols}
-    """
     if df.empty:
         return []
 
@@ -515,15 +534,26 @@ def build_issue_catalogue(df: pd.DataFrame) -> list[dict]:
 
     status = s("status", 0).astype("Int64")
     h1 = s("h1_count", 0).fillna(0).astype(int)
+    title = s("title", "").fillna("")
     title_len = s("title_length", 0).fillna(0).astype(int)
+    meta_desc = s("meta_description", "").fillna("")
     meta_desc_len = s("meta_description_length", 0).fillna(0).astype(int)
     noindex_meta = s("blocked_by_robots_meta", False).fillna(False)
     noindex_x = s("blocked_by_xrobots", False).fillna(False)
+    canonical = s("canonical", "")
     canonical_not_self = s("canonical_is_self", True).fillna(True) == False
     canonical_broken = s("canonical_resolves", True).fillna(True) == False
     imgs_missing_alt = s("images_missing_alt", 0).fillna(0).astype(int) > 0
     mixed_content = s("mixed_content", 0).fillna(0).astype(int) > 0
     viewport_missing = s("viewport", True).fillna(False) == False
+    html_lang_missing = s("html_lang", "").fillna("").astype(str).str.len() == 0
+    slow = s("response_time_ms", 0).fillna(0).astype(int) > SLOW_RESPONSE_MS
+    large = s("page_bytes", 0).fillna(0).astype(int) > LARGE_PAGE_BYTES
+    zero_internal_links = s("internal_links", 0).fillna(0).astype(int) == 0
+    orphanish = s("inlinks_internal", 0).fillna(0).astype(int) == 0
+
+    dup_title_mask = title.duplicated(keep=False)
+    dup_meta_mask = meta_desc.duplicated(keep=False)
 
     items: list[dict] = []
 
@@ -552,10 +582,28 @@ def build_issue_catalogue(df: pd.DataFrame) -> list[dict]:
         "cols": ["final_url", "meta_description", "meta_description_length"],
     })
     items.append({
+        "label": "Duplicate titles",
+        "mask": dup_title_mask & title.ne(""),
+        "description": "Same <title> used by multiple pages.",
+        "cols": ["final_url", "title"],
+    })
+    items.append({
+        "label": "Duplicate meta descriptions",
+        "mask": dup_meta_mask & meta_desc.ne(""),
+        "description": "Same meta description used by multiple pages.",
+        "cols": ["final_url", "meta_description"],
+    })
+    items.append({
         "label": "Noindex (meta or header)",
         "mask": (noindex_meta | noindex_x),
         "description": "Pages blocked from indexing via meta robots or X-Robots-Tag.",
         "cols": ["final_url", "meta_robots", "x_robots"],
+    })
+    items.append({
+        "label": "Missing canonical",
+        "mask": canonical.astype(str).str.len() == 0,
+        "description": "No canonical tag found on the page.",
+        "cols": ["final_url", "canonical"],
     })
     items.append({
         "label": "Canonical not self-referential",
@@ -573,19 +621,49 @@ def build_issue_catalogue(df: pd.DataFrame) -> list[dict]:
         "label": "Images missing ALT",
         "mask": imgs_missing_alt,
         "description": "Images without alt text found on the page.",
-        "cols": ["final_url", "images", "images_missing_alt"],
+        "cols": ["final_url", "images", "images_missing_alt", "images_missing_alt_urls"],
     })
     items.append({
         "label": "Mixed content on HTTPS",
         "mask": mixed_content,
         "description": "HTTPS pages referencing http:// assets (upgrade to HTTPS).",
-        "cols": ["final_url", "mixed_content"],
+        "cols": ["final_url", "mixed_content", "mixed_content_urls"],
     })
     items.append({
         "label": "No viewport meta",
         "mask": viewport_missing,
         "description": "Missing responsive viewport meta tag.",
         "cols": ["final_url", "viewport"],
+    })
+    items.append({
+        "label": "Missing HTML lang",
+        "mask": html_lang_missing,
+        "description": "<html> element lacks a lang attribute.",
+        "cols": ["final_url", "html_lang"],
+    })
+    items.append({
+        "label": "Slow responses (>1500ms)",
+        "mask": slow,
+        "description": "Server response time above threshold (rough indicator).",
+        "cols": ["final_url", "response_time_ms"],
+    })
+    items.append({
+        "label": "Large pages (>2MB)",
+        "mask": large,
+        "description": "HTML response bytes exceed 2MB.",
+        "cols": ["final_url", "page_bytes"],
+    })
+    items.append({
+        "label": "Zero internal links",
+        "mask": zero_internal_links,
+        "description": "No internal links found on the page.",
+        "cols": ["final_url", "internal_links"],
+    })
+    items.append({
+        "label": "Orphan-ish (0 inlinks in crawl)",
+        "mask": orphanish,
+        "description": "No internal inlinks discovered within this crawl (limited to crawled set).",
+        "cols": ["final_url", "inlinks_internal"],
     })
 
     return items
@@ -594,6 +672,10 @@ def build_issue_catalogue(df: pd.DataFrame) -> list[dict]:
 def _issue_df(df: pd.DataFrame, mask: pd.Series, cols: list[str]) -> pd.DataFrame:
     cols = [c for c in cols if c in df.columns]
     out = df.loc[mask, cols].copy()
+    # string-ify lists for display
+    for c in ["images_missing_alt_urls", "mixed_content_urls"]:
+        if c in out.columns:
+            out[c] = out[c].apply(lambda v: "; ".join(v) if isinstance(v, list) else (v or ""))
     if "final_url" not in out.columns and "final_url" in df.columns:
         out.insert(0, "final_url", df.loc[mask, "final_url"])
     return out
@@ -625,12 +707,12 @@ def colour_badge(v: bool | int | None, good_when: str = "true") -> str:
 st.set_page_config(page_title="Technical SEO Auditor", layout="wide")
 
 st.title("🔎 Technical SEO Auditor")
-st.caption("A quick, pragmatic crawler to spot common technical SEO issues. All checks run in your local session.")
+st.caption("A pragmatic crawler to spot technical SEO issues. All checks run in your session.")
 
 with st.sidebar:
     st.header("Setup")
     start_url = st.text_input("Start URL (include https://)", placeholder="https://www.example.co.uk/")
-    max_pages = st.number_input("Maximum pages to crawl", min_value=1, max_value=2000, value=100, step=10)
+    max_pages = st.number_input("Maximum pages to crawl", min_value=1, max_value=3000, value=150, step=10)
     obey_robots = st.toggle("Respect robots.txt", value=True, help="Skips URLs disallowed for this user agent.")
     include_query = st.toggle("Include URLs with query strings", value=False)
     sitemap_seed = st.toggle("Use sitemap.xml to seed crawl", value=True, help="If found, uses URLs from sitemap as seeds.")
@@ -638,10 +720,6 @@ with st.sidebar:
     st.markdown("---")
     run_single = st.button("Audit single URL")
     run_crawl = st.button("Crawl & Audit")
-
-placeholder_summary = st.empty()
-placeholder_table = st.empty()
-placeholder_download = st.empty()
 
 if (run_single or run_crawl):
     if not start_url or not is_http_url(start_url):
@@ -725,11 +803,12 @@ if (run_single or run_crawl):
         - **Status**: Prioritise fixing 4xx/5xx pages. Redirects are fine, but avoid long chains.
         - **Indexable**: Pages with `noindex` (meta or header) will not appear in search results.
         - **Canonical**: Ensure canonical URLs resolve and match the page when appropriate (self-referential).
-        - **Titles & Descriptions**: Aim for succinct, unique, human-friendly copy. Typical ranges shown here are guidelines, not laws.
+        - **Titles & Descriptions**: Aim for succinct, unique, human-friendly copy. Typical ranges are guidelines, not laws.
         - **Headings**: Exactly one H1 per page is usually best for clarity.
-        - **Images ALT**: Add descriptive `alt` text for accessibility and SEO.
+        - **Images ALT**: Add descriptive `alt` text and compress large assets.
         - **Mixed content**: Replace `http://` assets with HTTPS equivalents.
-        - **Performance**: Response time is a crude proxy; use Lighthouse or the Chrome UX Report for Core Web Vitals.
+        - **Performance**: Response time here is crude; for CWV use Lighthouse or CrUX.
+        - **Orphans**: "Orphan-ish" is relative to the crawl set; a full site map/analytics gives the truth.
         """
     )
 
