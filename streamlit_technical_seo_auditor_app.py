@@ -77,7 +77,6 @@ class PageAudit:
 
     images: int | None
     images_missing_alt: int | None
-    images_missing_alt_urls: list[str] | None = field(default=None)
 
     internal_links: int | None
     external_links: int | None
@@ -91,12 +90,14 @@ class PageAudit:
 
     https: bool
     mixed_content: int | None
-    mixed_content_urls: list[str] | None = field(default=None)
 
     indexable: bool | None
     blocked_by_robots_meta: bool | None
     blocked_by_xrobots: bool | None
 
+    # Defaults must come last in a dataclass
+    images_missing_alt_urls: list[str] | None = None
+    mixed_content_urls: list[str] | None = None
     inlinks_internal: int | None = None  # computed post-crawl
 
     notes: str = ""
