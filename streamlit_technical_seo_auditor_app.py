@@ -501,138 +501,6 @@ def audits_to_df(audits: list[PageAudit]) -> pd.DataFrame:
     return df[existing_cols]
 
 
-def _safe_bool(val, default=False):
-    try:
-        if isinstance(val, bool):
-            return val
-        s = str(val).strip().lower()
-        if s in {"true", "1", "yes", "y"}:
-            return True
-        if s in {"false", "0", "no", "n"}:
-            return False
-        return default
-    except Exception:
-        return default
-
-
-def parse_custom_rules(file) -> list[dict]:
-    """Parse a CSV of custom rules. Flexible columns supported.
-    Expected columns (case-insensitive, best effort):
-    - Type (label)
-    - Scope (page|image|resource) [optional, default 'page']
-    - Field (column name in df or special: 'images_missing_alt_urls', 'mixed_content_urls')
-    - Operator (<, <=, >, >=, ==, !=, contains, not contains, regex)
-    - Value (string/number/pattern)
-    - Description (optional)
-    - Priority (optional)
-    """
-    import io
-    import pandas as _pd
-    try:
-        if hasattr(file, 'read'):
-            data = file.read()
-        else:
-            data = file
-        df_rules = _pd.read_csv(io.BytesIO(data))
-    except Exception:
-        return []
-    # normalise columns
-    df_rules.columns = [c.strip().lower() for c in df_rules.columns]
-    rules = []
-    for _, row in df_rules.iterrows():
-        d = {k: row.get(k) for k in df_rules.columns}
-        d['type'] = row.get('type') if 'type' in df_rules.columns else row.get('issue')
-        d['scope'] = (row.get('scope') or 'page').lower() if 'scope' in df_rules.columns else 'page'
-        d['field'] = row.get('field') if 'field' in df_rules.columns else None
-        d['operator'] = (row.get('operator') or '').strip().lower() if 'operator' in df_rules.columns else None
-        d['value'] = row.get('value') if 'value' in df_rules.columns else None
-        d['description'] = row.get('description') if 'description' in df_rules.columns else None
-        d['priority'] = row.get('priority') if 'priority' in df_rules.columns else None
-        if d['type']:
-            rules.append(d)
-    return rules
-
-
-def apply_custom_rules(df: pd.DataFrame, rules: list[dict]) -> list[dict]:
-    items: list[dict] = []
-    if not rules:
-        return items
-
-    def make_mask_series(op, series: pd.Series, value):
-        op = (op or '').lower()
-        try:
-            if op in {'<','<=','>','>=','==','!='}:
-                try:
-                    v = float(value)
-                    s = pd.to_numeric(series, errors='coerce')
-                except Exception:
-                    v = value
-                    s = series.astype(str)
-                if op == '<':
-                    return s < v
-                if op == '<=':
-                    return s <= v
-                if op == '>':
-                    return s > v
-                if op == '>=':
-                    return s >= v
-                if op == '==':
-                    return s == v
-                if op == '!=':
-                    return s != v
-            if op in {'contains','not contains'}:
-                s = series.astype(str).str.contains(str(value), na=False)
-                return ~s if op == 'not contains' else s
-            if op == 'regex':
-                s = series.astype(str).str.contains(str(value), regex=True, na=False)
-                return s
-        except Exception:
-            pass
-        return pd.Series([False]*len(df), index=df.index)
-
-    for r in rules:
-        label = str(r.get('type'))
-        scope = (r.get('scope') or 'page').lower()
-        field = r.get('field')
-        op = r.get('operator')
-        val = r.get('value')
-        desc = r.get('description') or f"Custom rule on {field or scope}"
-
-        if scope in {'image','resource'} and field in {'images_missing_alt_urls','mixed_content_urls'}:
-            col = field
-            if col in df.columns:
-                mask = df[col].apply(lambda v: isinstance(v, list) and len(v)>0)
-                items.append({
-                    'label': label,
-                    'mask': mask,
-                    'description': desc,
-                    'cols': ['final_url', col],
-                })
-            continue
-
-        if field and field in df.columns:
-            mask = make_mask_series(op, df[field], val)
-            items.append({
-                'label': label,
-                'mask': mask,
-                'description': desc,
-                'cols': ['final_url', field],
-            })
-        else:
-            lw = label.lower()
-            if 'alt' in lw and 'image' in lw and 'images_missing_alt_urls' in df.columns:
-                mask = df['images_missing_alt'].fillna(0).astype(int) > 0
-                items.append({'label': label, 'mask': mask, 'description': desc, 'cols': ['final_url','images_missing_alt','images_missing_alt_urls']})
-            elif 'mixed content' in lw and 'mixed_content_urls' in df.columns:
-                mask = df['mixed_content'].fillna(0).astype(int) > 0
-                items.append({'label': label, 'mask': mask, 'description': desc, 'cols': ['final_url','mixed_content','mixed_content_urls']})
-
-    return items
-
-
-def summarise_issues
-
-
 def summarise_issues(df: pd.DataFrame) -> dict[str, int]:
     issues = {
         "Non-200 status": int(((df["status"].fillna(0).astype(int) < 200) | (df["status"].fillna(0).astype(int) >= 300)).sum()) if "status" in df else 0,
@@ -851,10 +719,6 @@ with st.sidebar:
     sitemap_seed = st.toggle("Use sitemap.xml to seed crawl", value=True, help="If found, uses URLs from sitemap as seeds.")
 
     st.markdown("---")
-    st.subheader("Custom checks")
-    custom_file = st.file_uploader("Upload custom checks CSV", type=["csv"], help="Columns: Type, Scope (page|image|resource), Field, Operator (<,<=,>,>=,==,!=,contains,not contains,regex), Value, Description, Priority")
-
-    st.markdown("---")
     run_single = st.button("Audit single URL")
     run_crawl = st.button("Crawl & Audit")
 
@@ -875,16 +739,6 @@ if (run_single or run_crawl):
         st.stop()
 
     df = audits_to_df(audits)
-
-    # Parse custom rules if provided
-    custom_rules = []
-    if 'custom_file' in locals() and custom_file is not None:
-        try:
-            custom_rules = parse_custom_rules(custom_file)
-            if custom_rules:
-                st.success(f"Loaded {len(custom_rules)} custom check(s) from CSV.")
-        except Exception as e:
-            st.warning(f"Could not parse custom checks CSV: {e}")
 
     # Summary metrics
     issues = summarise_issues(df)
@@ -911,10 +765,6 @@ if (run_single or run_crawl):
     # Issues explorer (affected URLs + per-issue download)
     st.subheader("Issues & affected URLs")
     catalogue = build_issue_catalogue(df)
-    # Append custom rules as additional items
-    if custom_rules:
-        catalogue.extend(apply_custom_rules(df, custom_rules))
-
     any_issues = False
     for item in catalogue:
         count = int(item["mask"].sum())
